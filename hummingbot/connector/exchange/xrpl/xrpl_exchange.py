@@ -1124,15 +1124,10 @@ class XrplExchange(ExchangePyBase):
         """Cancel an XRPL offer by its offer sequence, tracked or not.
 
         ``_place_cancel`` reaches the venue through the in-flight tracker, so an
-        offer whose owning process is gone is unreachable. The ledger needs one
-        thing to cancel an offer -- the offer sequence -- and that is the leading
-        field of the exchange order id this connector issues:
-
-            ``<offer_sequence>-<last_ledger_sequence>-<tx_hash_prefix>``
-
-        Only the first field is read, so a bare ``"106553233"`` is accepted too;
-        anything else is rejected before a transaction is built. That makes an
-        untracked offer cancellable exactly like a tracked one.
+        offer whose owning process is gone is unreachable. The ledger only needs
+        the offer sequence, which is the leading field of the exchange order id
+        (``<sequence>-<pair>``), so an untracked offer can be cancelled exactly
+        like a tracked one.
         """
         try:
             offer_sequence = int(str(exchange_order_id).split("-")[0])
@@ -1151,32 +1146,28 @@ class XrplExchange(ExchangePyBase):
             max_retries=CONSTANTS.CANCEL_MAX_RETRY,
         )
         # temBAD_SEQUENCE means the offer is already gone -- that is the outcome
-        # we wanted, so it is not an error and there is nothing to confirm.
-        already_gone = submit_result.prelim_result == "temBAD_SEQUENCE"
-        if not submit_result.success and not already_gone:
+        # we wanted, so it is not an error.
+        if not submit_result.success and submit_result.prelim_result != "temBAD_SEQUENCE":
             raise ValueError(
                 f"OfferCancel for sequence {offer_sequence} failed: "
                 f"{submit_result.error or submit_result.prelim_result}"
             )
 
-        # Confirmation, not submission. The pool reports success for tesSUCCESS
-        # *and* terQUEUED, and a queued transaction can still fail or expire
-        # later. An orphaned offer has no tracker entry to notice that, so a
-        # cancel that only got as far as the queue would be reported as done
-        # while the offer is still live and fillable (review, #8542).
-        if not already_gone and submit_result.is_accepted and submit_result.signed_tx is not None:
-            verify_result: TransactionVerifyResult = (
-                await self.verification_pool.submit_verification(
-                    signed_tx=submit_result.signed_tx,
-                    prelim_result=submit_result.prelim_result or "tesSUCCESS",
-                    timeout=CONSTANTS.VERIFY_TX_TIMEOUT,
-                )
+        # Submission is not cancellation. ``terQUEUED`` means the transaction is
+        # sitting in the ledger's queue and can still fail or expire, and this
+        # path exists for offers nothing tracks -- so there is no later status
+        # update that would notice it never landed. Confirm here, or say so.
+        if submit_result.success and submit_result.signed_tx is not None:
+            verify_result: TransactionVerifyResult = await self.verification_pool.submit_verification(
+                signed_tx=submit_result.signed_tx,
+                prelim_result=submit_result.prelim_result or "tesSUCCESS",
+                timeout=CONSTANTS.VERIFY_TX_TIMEOUT,
             )
             if not verify_result.verified:
                 raise ValueError(
-                    f"OfferCancel for sequence {offer_sequence} was submitted but is "
-                    f"not confirmed on the ledger: "
-                    f"{verify_result.error or verify_result.final_result}"
+                    f"OfferCancel for sequence {offer_sequence} was submitted but not "
+                    f"confirmed on the ledger (prelim_result={submit_result.prelim_result}); "
+                    f"the offer may still be live."
                 )
 
         self.logger().info(
@@ -3235,14 +3226,7 @@ class XrplExchange(ExchangePyBase):
 
     def get_token_symbol_from_all_markets(self, code: str, issuer: str) -> Optional[str]:
         all_markets = self._make_xrpl_trading_pairs_request()
-        # Markets declaring a trading_pair_symbol are consulted first. That alias is an
-        # explicit naming decision, so it keeps precedence over the code-derived fallback
-        # and every lookup that resolved before still resolves to the same symbol. sorted()
-        # is stable, so markets keep their relative order within each group.
-        ordered_markets = sorted(
-            all_markets.items(), key=lambda item: item[1].trading_pair_symbol is None
-        )
-        for market_name, market in ordered_markets:
+        for market_name, market in all_markets.items():
             token_symbol = market.get_token_symbol(code, issuer)
 
             if token_symbol is not None:
